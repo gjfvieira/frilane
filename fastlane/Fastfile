@@ -1,0 +1,95 @@
+default_platform(:ios)
+
+platform :ios do
+
+  proj_dir = ENV['GITHUB_WORKSPACE']
+  app_id = ENV['X_BUNDLE_ID']
+  build_type = ENV['BUILD_TYPE']
+  dev = build_type == "development" ? true : false 
+  certificate_filename = "certificate.cer"
+  provisioning_filename = "embedded.mobileprovision"
+  provisioning_out_path = "#{proj_dir}/fastlane/profiles"
+  certificate_out_path = "#{proj_dir}/#{certificate_filename}"
+  ipa_out_filename =  "#{proj_dir}/ipa-patched/patched-app.ipa"
+  tmp_keychain_path = "/Users/runner/Library/Keychains/frilane-db"
+  tmp_keychain_pw = "frilane"
+  tmp_keychain_name = "frilane"
+  
+
+  api_key = app_store_connect_api_key()
+
+  desc "Fetch and install Certificate and provisioning profile"
+  lane :get_certificate do
+
+    create_keychain(
+      name: "#{tmp_keychain_name}",
+      password: "#{tmp_keychain_pw}",
+      default_keychain: true,
+      unlock: true
+    )
+
+    #match_nuke(
+    #  type: "appstore", 
+    #  api_key: api_key,
+    #  skip_confirmation: true
+    #)
+
+    match(
+      api_key: api_key,
+      type: "#{build_type}",
+      keychain_name: "#{tmp_keychain_name}",
+      force: true,
+      readonly: false
+    )
+
+    cert(
+      api_key: api_key,
+      development: dev,
+      filename: certificate_filename,
+      keychain_path: tmp_keychain_path
+    )
+
+    sigh(
+      api_key: api_key,
+      #adhoc: true,
+      filename: provisioning_filename,
+      output_path: "#{provisioning_out_path}",
+      app_identifier: "#{app_id}",
+      development: dev,
+      force: false
+    )
+
+    signing_identity = (Digest::SHA1.file  "#{certificate_out_path}").hexdigest().upcase
+        
+    sh("echo IOS_CERTID=#{signing_identity} >> $GITHUB_ENV")
+    
+    sh(
+      "security",
+      "set-key-partition-list",
+      "-S", "apple-tool:,apple:,", 
+      "-s", "-k", "#{tmp_keychain_pw}", 
+      "-D", signing_identity, 
+      "-t", "private", "#{tmp_keychain_name}")    
+  end
+
+  desc "Resign and Deploy Patched IPA"
+  lane :resign_deploy do |options|
+    
+    resign(
+      ipa: ipa_out_filename,
+      provisioning_profile: "#{provisioning_out_path}/#{provisioning_filename}",
+      signing_identity: ENV['IOS_CERTID'],
+      keychain_path: tmp_keychain_path
+    )
+
+    if not dev
+      pilot( 
+        api_key: api_key,  
+        ipa: ipa_out_filename,
+        skip_waiting_for_build_processing: true
+      )
+    end
+
+  end
+
+end

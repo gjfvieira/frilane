@@ -1,0 +1,195 @@
+#!/bin/bash
+
+#######################################################################################################
+#                                    Nox 2022                                                         #
+#                         IPA PATCHING WITH FRIDA GADGET USING FASTLANE                               # 
+#     (Script based on the work of 0xn3va - https://github.com/0xn3va/ipa-patching)                   #
+#                                  Big thanks !!                                                      #
+#######################################################################################################
+
+function crash {
+  echo "[-] Something went wrong"
+  quit
+}
+
+function quit {
+  echo "[*] Done - Cleaning up"
+  rm -rf "${TEMP_DIR}"
+  exit
+}
+
+###
+# Setting main variables 
+###
+
+ 
+PATCHING_PROJECT_DIR=$(pwd)
+IPA="${PATCHING_PROJECT_DIR}/ipa-stock/topatch.ipa"
+TOOLS_DIR="${PATCHING_PROJECT_DIR}/patching-tools"
+OUTFILE="${PATCHING_PROJECT_DIR}/ipa-patched/patched-app.ipa"
+OPTOOL="${TOOLS_DIR}/optool"
+INSERT_DYLIB_TOOL="${TOOLS_DIR}/insert_dylib"
+TOOLCHAIN_PATH="/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/iphoneos"
+DYLIBS_DIR="${PATCHING_PROJECT_DIR}/dylibs"
+
+
+###
+# Preparing the environment
+##
+if $VERBOSITY; then
+  STDOUT=/dev/stdout
+else
+  STDOUT=/dev/null
+fi
+
+rm ${OUTFILE} 2>/dev/null
+echo ${PATCHING_PROJECT_DIR}
+mkdir ${PATCHING_PROJECT_DIR}/ipa-patched
+TEMP_DIR="$(mktemp -d /tmp/ipa-patching.XXXXX)"
+
+echo "[*] IPA patching started..."
+
+###
+# Extracting target ipa
+###
+echo "[+] Extracting target IPA"
+cd "${TEMP_DIR}" || crash
+unzip "${IPA}" > /dev/null || crash
+cd Payload/*.app || crash
+APP_TMP_DIR="$(pwd)"
+
+
+###
+# Executing gum-graft, two operating modes:
+# 1) Instrumentation of offsets from LC_FUNCTION_STARTS
+# 2) Custom offsets 
+###
+  
+
+
+if [[ "$GUM_GRAFT_ALL" == "true" ]] || [ ! -z "$GUM_GRAFT_OFFSET" ]
+then
+    BUNDLE_EXECUTABLE=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" Info.plist)
+    if [[ "$GUM_GRAFT_ALL" == "true" ]] 
+    then
+      echo "[+] Gum Graft offsets included in LC_FUNCTION_STARTS"
+      ${PATCHING_PROJECT_DIR}/gum-graft -s "$BUNDLE_EXECUTABLE"
+    fi
+
+    if [ ! -z "$GUM_GRAFT_OFFSET" ] 
+    then
+      echo "[+] Gum Graft custom offseets"
+      while read offset
+      do
+        offsets+="--instrument=$offset "
+      done < ${PATCHING_PROJECT_DIR}/graft-offsets.lst
+      ${PATCHING_PROJECT_DIR}/gum-graft "$offsets" -m "$BUNDLE_EXECUTABLE"
+    fi
+fi
+
+
+###
+# Copy dylibs and Frameworks to SwiftSupport and dylibs folder
+###
+
+echo "[+] Add SwiftSupport"
+{
+if [ -d "${APP_TMP_DIR}/Frameworks" ];
+then
+    mkdir -p "${TEMP_DIR}/SwiftSupport"
+    mkdir -p "${TEMP_DIR}/SwiftSupport/iphoneos"
+    cd "${APP_TMP_DIR}/Frameworks" || crash
+    for SWIFT_LIB in *.dylib; do 
+        if [ ! -f "${TEMP_DIR}/SwiftSupport/iphoneos/${SWIFT_LIB}" ];
+        then
+          echo "[-] Copying ${SWIFT_LIB}"
+          cp "${TOOLCHAIN_PATH}/${SWIFT_LIB}" "${TEMP_DIR}/SwiftSupport/iphoneos" 2>/dev/null
+        else
+          echo "[-] Skipping ${SWIFT_LIB} - File exists"
+        fi
+    done
+fi
+} &> $STDOUT
+
+###
+# Injecting dylibs and Frida Gadget
+###
+echo "[+] Injecting dylibs and Frida Gadget"
+
+function copy_framework_and_load {
+	framework=$1
+	frameworkDylib=${framework%.framework}
+	copy_dylib_and_load "$framework/$frameworkDylib"
+}
+
+function copy_dylib_and_load {
+	dylib=$1
+	echo -n '     '
+	echo "Install Load: $file -> @executable_path/Frameworks/$dylib"
+  EXECUTABLE=$(plutil -convert xml1 -o - Info.plist | xmllint --xpath 'string(/plist/dict/key[text()="CFBundleExecutable"]/following-sibling::string)' -)
+  ${INSERT_DYLIB_TOOL} --strip-codesig --inplace "@executable_path/Frameworks/$dylib" "${EXECUTABLE}" || crash
+}
+
+{
+  cd "${APP_TMP_DIR}"
+  for file in `ls -1 "$DYLIBS_DIR"`; do
+    if [[ "$file" == *.framework ]]
+		then
+        cp -rf "$DYLIBS_DIR/$file" "${APP_TMP_DIR}/Frameworks" 2>/dev/null
+        if [[ "$BUILD_TYPE" == "development" ]] 
+        then
+          echo "[+] Removing code_signing required for development builds"
+          jq 'del(.code_signing)' "${APP_TMP_DIR}/Frameworks/$file/config.json" > temp.json && mv temp.json "${APP_TMP_DIR}/Frameworks/$file/config.json"
+        fi
+		    copy_framework_and_load "$file"
+		else
+		    copy_dylib_and_load "$file"
+	  fi
+	done
+} &> $STDOUT
+
+
+###
+# Replacing bundle versions
+###
+
+X_BUNDLE_VERSION="${X_SHORT_BUNDLE_VERSION//[-._]/}"
+
+echo "[+] Replacing CFBundleVersion and CFBundleShortVersion with ${X_BUNDLE_VERSION} / ${X_SHORT_BUNDLE_VERSION}"
+{
+  cd "${APP_TMP_DIR}"
+  plutil -replace CFBundleVersion -string "${X_BUNDLE_VERSION}" Info.plist
+  plutil -replace CFBundleShortVersion -string "${X_SHORT_BUNDLE_VERSION}" Info.plist
+  plutil -replace CFBundleShortVersionString -string "${X_SHORT_BUNDLE_VERSION}" Info.plist
+} > /dev/null || crash
+
+
+###
+# Replacing bundle id in plugins
+###
+if [ -d "PlugIns" ]; then
+  {
+  cd PlugIns || crash
+  for PLUGIN in *; do
+    if [ -d "${PLUGIN}" ]; then
+      BUNDLE_NAME=$(plutil -convert xml1 -o - "${PLUGIN}/Info.plist" | xmllint --xpath 'string(/plist/dict/key[text()="CFBundleName"]/following-sibling::string)' -)
+      plutil -replace CFBundleIdentifier -string "${X_BUNDLE_ID}.${BUNDLE_NAME}" "${PLUGIN}/Info.plist"
+    fi
+  done
+  } > /dev/null || crash
+fi
+
+###
+# Repacking
+###
+echo "[+] Repacking patched IPA"
+cd "${TEMP_DIR}" || crash
+zip -qry "${OUTFILE}" ./* > /dev/null || crash
+
+
+###
+# Signing and Deploying
+###
+echo "[+] Fastlane taking control for re-signing and deploying to TestFlight/Local build"
+cd "${PATCHING_PROJECT_DIR}"
+quit

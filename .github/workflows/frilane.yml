@@ -1,0 +1,162 @@
+# Automated Frida Patching and Fastlane Deploy to Testflight
+
+name: Frilane
+
+on:
+  workflow_dispatch:
+   inputs:
+      verbose:
+        type: boolean 
+        description: 'Verbose'
+        default: false
+        required: false
+      gum-graft-all:
+        type: boolean
+        description: 'gum-graft LC_FUNCTION_STARTS offsets'
+        default: false
+        required: false
+      gum-graft-offset:
+        description: 'gum-graft offsets - ex.[0x1231,0x3134]'
+        default: ''
+        required: false
+      upgrade-gadget:
+        type: boolean
+        description: 'Upgrade frida gadget'
+        default: false
+        required: false    
+      arch:
+        type: choice
+        description: 'Gadget Arch'
+        options:
+          - 'arm64'
+          - 'arm64e'
+          - 'arm64eoabi'
+          - 'x86_64-simulator'
+          - 'arm64-simulator'
+        default: 'arm64'
+        required: false  
+      appleid:
+        description: 'AppleID'
+        default: 'johndoe@changeme.org'
+        required: true
+      bundleid:
+        description: 'BundleID'
+        default: 'changeme'
+        required: true
+      buildtype:
+        description: 'Build type'
+        default: 'appstore'
+        type: choice
+        required: false
+        options:
+          - appstore
+          - development
+      bundleversion:
+        description: 'Bundle Version (increase each run)'
+        default: '1.23.45'
+        required: true
+      ipaurl:
+        type: string
+        description: 'URL of the IPA file to patch'
+        required: true
+
+jobs:
+  
+  frilane:
+    runs-on: macos-latest
+    env:
+      VERBOSITY: ${{github.event.inputs.verbose}}
+      UPGRADE_GADGET: ${{github.event.inputs.upgrade-gadget}}
+      GUM_GRAFT_ALL: ${{github.event.inputs.gum-graft-all}}
+      GUM_GRAFT_OFFSET: ${{github.event.inputs.gum-graft-offset}}
+      X_APPLE_ID: ${{ github.event.inputs.appleid }}
+      X_BUNDLE_ID: ${{ github.event.inputs.bundleid }}
+      X_SHORT_BUNDLE_VERSION: ${{ github.event.inputs.bundleversion }}
+      BUILD_TYPE: ${{ github.event.inputs.buildtype }}
+      APP_STORE_CONNECT_API_KEY_KEY_ID: ${{ secrets.KEYID }}
+      APP_STORE_CONNECT_API_KEY_ISSUER_ID: ${{ secrets.ISSUERID }}
+      APP_STORE_CONNECT_API_KEY_KEY: ${{secrets.KEY}}
+      APP_STORE_CONNECT_API_KEY_IS_KEY_CONTENT_BASE64: false
+      APP_STORE_CONNECT_API_KEY_DURATION: 500
+      APP_STORE_CONNECT_API_KEY_IN_HOUSE: false
+      MATCH_CERT_GIT_URL: ${{secrets.MATCH_CERT_GIT_URL}}
+      MATCH_TEAM_ID: ${{secrets.MATCH_TEAM_ID}}
+      MATCH_GIT_BASIC_AUTHORIZATION: ${{secrets.MATCH_GIT_BASIC_AUTHORIZATION}}
+      MATCH_PASSWORD: ${{secrets.MATCH_PASSWORD}}
+      MATCH_USERNAME: ${{ github.event.inputs.appleid }}
+
+    steps:
+    
+      - uses: actions/checkout@v2
+       
+      - name: Obtain and Install Apple certificates
+        run: |
+          printf "git_url(\"${MATCH_CERT_GIT_URL}\") \ntype(\"appstore\") \nstorage_mode(\"git\") \nteam_id(\"${MATCH_TEAM_ID}\")" > ./fastlane/Matchfile
+          printf "app_identifier(\"${X_BUNDLE_ID}\") \napple_id(\"${X_APPLE_ID}\")" > ./fastlane/AppFile
+          fastlane get_certificate          
+          
+      - name: Compile Frida Gadget
+        if: ${{ env.UPGRADE_GADGET == 'true' }}
+        run: |
+          git clone --recurse-submodules https://github.com/frida/frida.git
+          cd frida
+          make core-ios FRIDA_JAILBREAK=disabled
+
+      - name: Create Framework
+        if: ${{ env.UPGRADE_GADGET == 'true' }}
+        run: |
+          rm -rf dylibs/*
+          cd dylibs
+          mv ../frida/build/frida-ios-${{ github.event.inputs.arch }}/usr/lib/frida/frida-gadget.dylib .
+          lipo -create frida-gadget.dylib -output Frida
+          codesign --remove-signature Frida
+          install_name_tool -id @rpath/Frida.framework/Frida Frida 
+          mkdir Frida.framework
+          mv Frida Frida.framework
+          cp ../framework-utils/* ./Frida.framework/
+          plutil -replace CFBundleIdentifier -string "Frilane" Frida.framework/Info.plist
+          
+      - name: Upload frida-gadget
+        if: ${{ env.UPGRADE_GADGET == 'true' }}
+        uses: actions/upload-artifact@v3
+        with:
+          name: frida-gadget-ios-framework
+          path: dylibs/Frida.framework
+          retention-days: 30
+
+      - name: Download IPA file to patch
+        run: mkdir ipa-stock && curl ${{github.event.inputs.ipaurl}} -o ipa-stock/topatch.ipa -s
+
+      - name: Downloading gum-graft
+        if: ${{env.GUM_GRAFT_ALL == 'true' || env.GUM_GRAFT_OFFSET != ''}}
+        run: |
+          GUM_URL=$(curl -L --retry-all-errors --retry-delay 0 --connect-timeout 5 --retry-max-time 30 -s  "https://api.github.com/repos/frida/frida/releases/latest" | jq '.assets[].browser_download_url' | grep "gum-graft" | grep "x86" | sed 's/"//g')
+          curl -L "$GUM_URL" -o gum-graft.xz
+          xz -d gum-graft.xz
+          chmod +x gum-graft
+      
+      - name: Preparing gum-graft offsets
+        if: ${{ env.GUM_GRAFT_OFFSET != '' }}
+        run: |
+          offsets=(${{ fromJSON(github.event.inputs.gum-graft-offset)[0] && format('"$(cat << "EOF"
+          {0}
+          EOF
+          )"', join(fromJSON(github.event.inputs.gum-graft-offset), '
+          EOF
+          )" "$(cat << "EOF"
+          ')) || ''}})
+          printf "%s\n" "${offsets[@]}" > graft-offsets.lst "$i"
+
+      - name: Execute frilane script
+        run: ./frilane
+  
+      - name: Execute fastlane
+        run: fastlane resign_deploy
+      
+      - name: Upload IPA (only dev) artifact
+        if: ${{ env.BUILD_TYPE == 'development' }}
+        uses: actions/upload-artifact@v3
+        with:
+          name: patch-ipa-development
+          path: ipa-patched/patched-app.ipa
+          retention-days: 1
